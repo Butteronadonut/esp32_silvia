@@ -1,0 +1,293 @@
+// --- Hardware and Library Includes ---
+#include <WiFi.h>
+#include <WiFiUdp.h>      // Included from original, though not strictly used for current functionality
+#include <PubSubClient.h> // For MQTT communication
+#include "max6675.h"      // For MAX6675 thermocouple
+#include <PID_v1.h>       // For PID control algorithm
+
+// --- WiFi & MQTT Network Configuration ---
+const char* ssid = "Moonbase";            // Your WiFi SSID
+const char* password = "unclejesse4";     // Your WiFi Password
+const char* mqtt_server = "10.0.0.216";   // Your MQTT Broker IP Address
+
+// --- WiFi and MQTT Client Objects ---
+WiFiClient espClient;           // WiFi client for MQTT
+PubSubClient client(espClient); // MQTT client instance
+
+// --- Hardware Pin Definitions ---
+const int thermoCLK = 12; // MAX6675 SPI Clock pin
+const int thermoCS  = 11; // MAX6675 Chip Select pin
+const int thermoDO  = 10; // MAX6675 Data Out pin
+const int SSR_PIN = 2;    // Pin connected to the Solid State Relay
+
+// --- LED Definitions ---
+// These are typical ESP32-C3 definitions. If using another ESP32 board,
+// you might need to replace LEDR, LEDG, LEDB with actual GPIO numbers (e.g., 33, 32, 25).
+#define LED_RED     LEDR    // Red LED for SSR ON indicator (or other status)
+#define LED_GREEN   LEDG    // Green LED (currently unused for specific status)
+#define LED_BLUE    LEDB    // Blue LED for SSR OFF indicator (or other status)
+
+// Fallback for LED_BUILTIN if not defined by board (common on many ESP32s)
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2 // A common default for ESP32 boards
+#endif
+
+// --- Thermocouple Object ---
+MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
+
+// --- PID Control Variables ---
+double Setpoint = 105.0; // Target temperature in Celsius
+double Input;           // Current temperature reading from thermocouple
+double Output;          // Calculated output from PID (SSR duty cycle in ms)
+
+// Default PID constants - these values are loaded upon every restart
+// Kp = 2.8: Aggressive proportional response for fast initial heating
+// Ki = 2.5: Increased integral constant significantly to overcome flatlining/slow approach
+// Kd = 3.0: Slightly increased derivative to try and curb overshoot more aggressively
+double Kp = 4;
+double Ki = 5;
+double Kd = 5;
+
+// Initialize the PID controller
+// Parameters: Input, Output, Setpoint, Kp, Ki, Kd, Direction (DIRECT means output increases with error)
+PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+
+// --- Control Window Size ---
+// Total duration of one PID control cycle in milliseconds (e.g., 1000ms = 1 second)
+unsigned long windowSize = 1000;
+
+// --- MQTT Publish Timing Variable ---
+unsigned long lastMsg = 0; // Stores the last time an MQTT message was published
+
+// --- Bang-Bang to PID Transition Threshold (for heating) ---
+// When the temperature is more than this many degrees below Setpoint, apply full power.
+// Otherwise, let PID control.
+const float TEMP_THRESHOLD_FOR_FULL_POWER = 15.0; // If Input < (Setpoint - 15.0), full power
+
+// --- Rate of Change Variables ---
+float dTemp_dt = 0.0;           // Rate of change of temperature in degrees C per second
+// Stores the temperature reading from the beginning of the rate calculation interval
+float tempAtRateCalculationStart = 0.0;
+// Stores millis() when tempAtRateCalculationStart was recorded
+unsigned long lastRateCalculationTime = 0;
+
+// Interval over which to calculate dTemp_dt for smoothing (3 seconds)
+const unsigned long RATE_CALCULATION_INTERVAL = 3000;
+
+// --- Threshold for activating full power based on rapid temperature drop ---
+const float RAPID_DROP_THRESHOLD = -0.5; // If dTemp_dt is -0.5 C/sec or lower, activate full power
+
+// --- Overshoot Cap Threshold and Duty ---
+// If temperature is more than this many degrees ABOVE Setpoint, cap duty cycle.
+const float OVERSHOOT_CAP_THRESHOLD = 0.1; // If Input > (Setpoint + 1.0), cap duty
+const double OVERSHOOT_CAP_DUTY = 0.01 * windowSize; // Cap duty cycle at 2% of windowSize
+
+// --- Function: MQTT Reconnection Logic ---
+// This function attempts to reconnect to the MQTT broker if the connection is lost.
+void reconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Create a random client ID to avoid conflicts if multiple devices are used
+    String clientId = "ESP32SilviaClient-";
+    clientId += String(random(0xffff), HEX); // Append random hex for uniqueness
+
+    // Attempt to connect with the generated client ID
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+      digitalWrite(LED_BUILTIN, HIGH); // Turn on built-in LED to indicate successful MQTT connection
+      // If you needed to subscribe to any topics, you would do it here, e.g.:
+      // client.subscribe("silvia/setpoint_cmd");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state()); // Print the MQTT reason code for failure
+      Serial.println(" trying again in 5 seconds");
+      digitalWrite(LED_BUILTIN, LOW); // Blink built-in LED to indicate MQTT connection issue
+      delay(5000); // Wait 5 seconds before next retry
+    }
+  }
+}
+
+// --- Function: Apply SSR Output (Duty Cycle Control) ---
+// This function controls the Solid State Relay based on the calculated duty.
+// It implements a time-proportional control by turning the SSR ON for 'duty' ms
+// and OFF for 'windowSize - duty' ms.
+void applyOutput(double duty) {
+  // Ensure duty cycle is non-negative and within the window size
+  duty = constrain(duty, 0, windowSize); // Prevents negative or excessively large duty cycles
+
+  // Turn SSR ON for the calculated 'duty' duration
+  if (duty > 0) { // Only turn on if there's a positive duty cycle
+    digitalWrite(SSR_PIN, HIGH);
+    digitalWrite(LED_RED, LOW);     // Assuming LOW turns on the LED (common anode or inverse logic)
+    digitalWrite(LED_GREEN, HIGH);  // Other LEDs off
+    digitalWrite(LED_BLUE, HIGH);
+    delay((int)duty); // Keep SSR active for this duration
+  }
+
+  // Turn SSR OFF for the remaining part of the window cycle
+  digitalWrite(SSR_PIN, LOW);
+  digitalWrite(LED_RED, HIGH);    // Assuming HIGH turns off the LED
+    digitalWrite(LED_GREEN, HIGH);
+  digitalWrite(LED_BLUE, LOW);    // Assuming LOW turns on the LED, indicating SSR is off
+  delay((int)(windowSize - duty)); // Keep SSR inactive for the remaining duration
+}
+
+// --- Setup Function: Runs once on startup ---
+void setup() {
+  Serial.begin(115200); // Initialize Serial communication for debugging
+
+  // Configure SSR pin as output and ensure it's off
+  pinMode(SSR_PIN, OUTPUT);
+  digitalWrite(SSR_PIN, LOW);
+
+  // Configure LED pins as outputs
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  // Initialize LEDs to a default OFF state (assuming HIGH turns off common anode LEDs)
+  digitalWrite(LED_RED, HIGH);
+  digitalWrite(LED_GREEN, HIGH);
+  digitalWrite(LED_BLUE, HIGH);
+  digitalWrite(LED_BUILTIN, LOW); // Ensure built-in LED is off initially
+
+  // --- WiFi Connection ---
+  Serial.print("Connecting to WiFi ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password); // Start WiFi connection
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // Blink built-in LED during connection
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  digitalWrite(LED_BUILTIN, HIGH); // Solid built-in LED once WiFi is connected
+
+  // --- MQTT Client Setup ---
+  client.setServer(mqtt_server, 1883); // Set MQTT broker IP and port (default 1883)
+  // If you had a callback function for incoming MQTT messages, you'd set it here:
+  // client.setCallback(callback);
+
+  // --- PID Controller Initialization ---
+  myPID.SetOutputLimits(0, windowSize); // Set PID output limits to match window size
+  myPID.SetMode(AUTOMATIC);             // Set PID to automatic control mode
+  myPID.SetTunings(Kp, Ki, Kd);         // Apply the initial PID tuning constants
+
+  // --- Initial Status Output ---
+  Serial.println("PID control system started.");
+  Serial.print("Initial Kp: "); Serial.println(Kp);
+  Serial.print("Initial Ki: "); Serial.println(Ki);
+  Serial.print("Initial Kd: "); Serial.println(Kd);
+  Serial.print("Target Setpoint: "); Serial.println(Setpoint);
+
+  // Initialize rate of change variables
+  tempAtRateCalculationStart = thermocouple.readCelsius();
+  lastRateCalculationTime = millis();
+}
+
+// --- Loop Function: Runs repeatedly after setup ---
+void loop() {
+  // --- MQTT Connection Check and Maintenance ---
+  if (!client.connected()) {
+    reconnect(); // Attempt to reconnect if not connected
+  }
+  client.loop(); // Must be called frequently to process MQTT messages and maintain connection
+
+  // --- Temperature Reading ---
+  Input = thermocouple.readCelsius(); // Read current temperature from thermocouple
+
+  // --- Calculate Rate of Change over 3-second window ---
+  unsigned long now = millis();
+  if (now - lastRateCalculationTime >= RATE_CALCULATION_INTERVAL) { // Calculate dTemp_dt every 3 seconds
+    float tempChange = Input - tempAtRateCalculationStart;
+    unsigned long timeElapsed = now - lastRateCalculationTime; // In milliseconds
+
+    // Calculate dTemp_dt in degrees C per second
+    if (timeElapsed > 0) {
+      dTemp_dt = (tempChange / (float)timeElapsed) * 1000.0;
+    } else {
+      dTemp_dt = 0.0; // No change if no time has passed (shouldn't happen with interval check)
+    }
+
+    // Reset for the next 3-second calculation window
+    tempAtRateCalculationStart = Input;
+    lastRateCalculationTime = now;
+  }
+
+  double currentDuty = 0; // Variable to store the duty cycle to apply
+
+  // --- Control Logic: Determine base duty (Bang-Bang or PID) ---
+  if (Input < (Setpoint - TEMP_THRESHOLD_FOR_FULL_POWER) || dTemp_dt < RAPID_DROP_THRESHOLD) {
+    // If temperature is far below setpoint OR temperature is dropping rapidly, apply full power (Bang-Bang mode)
+    currentDuty = windowSize;
+    Serial.print("***** BANG-BANG MODE (Heating) ***** Temp: ");
+    Serial.print(Input);
+    Serial.print(" C | dTemp/dt: ");
+    Serial.print(dTemp_dt, 2); // Print with 2 decimal places
+    Serial.print(" C/s | Target for PID: >");
+    Serial.print(Setpoint - TEMP_THRESHOLD_FOR_FULL_POWER);
+    Serial.print(" C | Duty: ");
+    Serial.println(currentDuty);
+  } else {
+    // If temperature is close to setpoint AND not dropping rapidly, let PID control
+    myPID.Compute(); // Calculate the new PID output (duty cycle)
+    currentDuty = Output;
+    Serial.print("PID MODE. Temp: ");
+    Serial.print(Input);
+    Serial.print(" C | dTemp/dt: ");
+    Serial.print(dTemp_dt, 2); // Print with 2 decimal places
+    Serial.print(" C/s | Setpoint: ");
+    Serial.print(Setpoint);
+    Serial.print(" C | Duty: ");
+    Serial.println(currentDuty);
+  }
+
+  // --- Overshoot Protection: Cap duty cycle if significantly over setpoint ---
+  if (Input > (Setpoint + OVERSHOOT_CAP_THRESHOLD)) {
+    // If temperature is more than 1 degree above setpoint, drastically reduce power
+    currentDuty = OVERSHOOT_CAP_DUTY;
+    Serial.print("!!! OVERSHOOT CAP !!! Temp: ");
+    Serial.print(Input);
+    Serial.print(" C | Capping Duty to: ");
+    Serial.println(currentDuty);
+  }
+
+
+  // --- Apply SSR Output ---
+  applyOutput(currentDuty); // Control the SSR based on the determined duty cycle
+
+  // --- MQTT Data Publishing ---
+  // Publish data approximately every 2 seconds to avoid flooding the broker and provide timely updates
+  if (now - lastMsg > 2000) {
+    lastMsg = now; // Update the last message time
+
+    char tempBuffer[16];     // Buffer for temperature string
+    char setpointBuffer[16]; // Buffer for setpoint string
+    char dutyBuffer[16];     // Buffer for duty cycle string
+    char dTemp_dtBuffer[16]; // Buffer for dTemp_dt string
+
+    // Convert values to strings
+    dtostrf(Input, 1, 2, tempBuffer);        // Format Input with 2 decimal places
+    dtostrf(Setpoint, 1, 2, setpointBuffer); // Format Setpoint with 2 decimal places
+    dtostrf(currentDuty, 1, 2, dutyBuffer);  // Publish the actual duty applied
+    dtostrf(dTemp_dt, 1, 2, dTemp_dtBuffer); // Format dTemp_dt with 2 decimal places
+
+    // Publish each value to its respective sub-topic
+    Serial.print("Publishing to 'silvia/temp': "); Serial.println(tempBuffer);
+    client.publish("silvia/temp", tempBuffer);
+
+    Serial.print("Publishing to 'silvia/setpoint': "); Serial.println(setpointBuffer);
+    client.publish("silvia/setpoint", setpointBuffer);
+
+    Serial.print("Publishing to 'silvia/duty': "); Serial.println(dutyBuffer);
+    client.publish("silvia/duty", dutyBuffer);
+
+    Serial.print("Publishing to 'silvia/dtemp_dt': "); Serial.println(dTemp_dtBuffer);
+    client.publish("silvia/dtemp_dt", dTemp_dtBuffer);
+  }
+}
