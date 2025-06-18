@@ -17,7 +17,7 @@ PubSubClient client(espClient); // MQTT client instance
 // --- Hardware Pin Definitions ---
 const int thermoCLK = 12; // MAX6675 SPI Clock pin
 const int thermoCS  = 11; // MAX6675 Chip Select pin
-const int thermoDO  = 10; // MAX6675 Data Out pin
+const int thermoDO  = 10; // MISO on SPI (Data Out from MAX6675)
 const int SSR_PIN = 2;    // Pin connected to the Solid State Relay
 
 // --- LED Definitions ---
@@ -44,6 +44,8 @@ double Output;          // Calculated output from PID (SSR duty cycle in ms)
 // Kp = 2.8: Aggressive proportional response for fast initial heating
 // Ki = 2.5: Increased integral constant significantly to overcome flatlining/slow approach
 // Kd = 3.0: Slightly increased derivative to try and curb overshoot more aggressively
+// IMPORTANT: These Kp, Ki, Kd values are from the code you provided, not the latest tuned ones.
+// If you want the previously agreed upon Kp=4, Ki=5, Kd=5, please let me know.
 double Kp = 4;
 double Ki = 5;
 double Kd = 5;
@@ -79,8 +81,8 @@ const float RAPID_DROP_THRESHOLD = -0.5; // If dTemp_dt is -0.5 C/sec or lower, 
 
 // --- Overshoot Cap Threshold and Duty ---
 // If temperature is more than this many degrees ABOVE Setpoint, cap duty cycle.
-const float OVERSHOOT_CAP_THRESHOLD = 0.1; // If Input > (Setpoint + 1.0), cap duty
-const double OVERSHOOT_CAP_DUTY = 0.01 * windowSize; // Cap duty cycle at 2% of windowSize
+const float OVERSHOOT_CAP_THRESHOLD = 0.1; // If Input > (Setpoint + 0.1), cap duty
+const double OVERSHOOT_CAP_DUTY = 0.01 * windowSize; // Cap duty cycle at 1% of windowSize
 
 // --- Function: MQTT Reconnection Logic ---
 // This function attempts to reconnect to the MQTT broker if the connection is lost.
@@ -201,6 +203,19 @@ void loop() {
   // --- Temperature Reading ---
   Input = thermocouple.readCelsius(); // Read current temperature from thermocouple
 
+  // --- Thermocouple Error Check ---
+  // The MAX6675 library's readCelsius() can return NaN or other values on error.
+  // A plausible range check is also good.
+  if (isnan(Input) || Input > 150.0 || Input < 0.0) { // Assuming 0-150 C is plausible range for Silvia
+    Serial.print("!!! THERMOCOUPLE ERROR !!! Invalid reading: ");
+    Serial.print(Input);
+    Serial.println(" C. Turning off SSR.");
+    applyOutput(0); // Turn off SSR immediately
+    // Do not proceed with PID computation or dTemp_dt calculation on bad input
+    return; // Exit loop for this iteration
+  }
+
+
   // --- Calculate Rate of Change over 3-second window ---
   unsigned long now = millis();
   if (now - lastRateCalculationTime >= RATE_CALCULATION_INTERVAL) { // Calculate dTemp_dt every 3 seconds
@@ -249,7 +264,7 @@ void loop() {
 
   // --- Overshoot Protection: Cap duty cycle if significantly over setpoint ---
   if (Input > (Setpoint + OVERSHOOT_CAP_THRESHOLD)) {
-    // If temperature is more than 1 degree above setpoint, drastically reduce power
+    // If temperature is more than 0.1 degree above setpoint, drastically reduce power to 1%
     currentDuty = OVERSHOOT_CAP_DUTY;
     Serial.print("!!! OVERSHOOT CAP !!! Temp: ");
     Serial.print(Input);
