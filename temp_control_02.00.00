@@ -41,11 +41,6 @@ double Input;           // Current temperature reading from thermocouple
 double Output;          // Calculated output from PID (SSR duty cycle in ms)
 
 // Default PID constants - these values are loaded upon every restart
-// Kp = 2.8: Aggressive proportional response for fast initial heating
-// Ki = 2.5: Increased integral constant significantly to overcome flatlining/slow approach
-// Kd = 3.0: Slightly increased derivative to try and curb overshoot more aggressively
-// IMPORTANT: These Kp, Ki, Kd values are from the code you provided, not the latest tuned ones.
-// If you want the previously agreed upon Kp=4, Ki=5, Kd=5, please let me know.
 double Kp = 4;
 double Ki = 5;
 double Kd = 5;
@@ -84,56 +79,71 @@ const float RAPID_DROP_THRESHOLD = -0.5; // If dTemp_dt is -0.5 C/sec or lower, 
 const float OVERSHOOT_CAP_THRESHOLD = 0.1; // If Input > (Setpoint + 0.1), cap duty
 const double OVERSHOOT_CAP_DUTY = 0.01 * windowSize; // Cap duty cycle at 1% of windowSize
 
-// --- Function: MQTT Reconnection Logic ---
-// This function attempts to reconnect to the MQTT broker if the connection is lost.
-void reconnect() {
-  // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    // Create a random client ID to avoid conflicts if multiple devices are used
-    String clientId = "ESP32SilviaClient-";
-    clientId += String(random(0xffff), HEX); // Append random hex for uniqueness
+// --- Non-Blocking SSR Control Variables ---
+unsigned long ssrWindowStartTime = 0; // Timestamp when the current SSR control window started
+bool ssrOnState = false;              // True if SSR is currently commanded ON
+unsigned long ssrOnDuration = 0;      // How long SSR should be ON in the current cycle
 
-    // Attempt to connect with the generated client ID
+// --- Non-Blocking Reconnect Variables ---
+unsigned long lastReconnectAttempt = 0;
+const unsigned long RECONNECT_INTERVAL = 5000; // Attempt reconnect every 5 seconds
+
+// --- Function: Non-Blocking MQTT Reconnection Logic ---
+// This function attempts to reconnect to the MQTT broker periodically without blocking.
+void reconnectNonBlocking() {
+  unsigned long now = millis();
+  if (!client.connected() && (now - lastReconnectAttempt > RECONNECT_INTERVAL)) {
+    lastReconnectAttempt = now;
+    Serial.print("Attempting MQTT connection...");
+    String clientId = "ESP32SilviaClient-";
+    clientId += String(random(0xffff), HEX);
     if (client.connect(clientId.c_str())) {
       Serial.println("connected");
-      digitalWrite(LED_BUILTIN, HIGH); // Turn on built-in LED to indicate successful MQTT connection
-      // If you needed to subscribe to any topics, you would do it here, e.g.:
-      // client.subscribe("silvia/setpoint_cmd");
+      digitalWrite(LED_BUILTIN, HIGH); // Turn on built-in LED
     } else {
       Serial.print("failed, rc=");
-      Serial.print(client.state()); // Print the MQTT reason code for failure
-      Serial.println(" trying again in 5 seconds");
-      digitalWrite(LED_BUILTIN, LOW); // Blink built-in LED to indicate MQTT connection issue
-      delay(5000); // Wait 5 seconds before next retry
+      Serial.print(client.state());
+      Serial.println(" (retrying)");
+      digitalWrite(LED_BUILTIN, LOW); // Blink built-in LED to indicate connection issue
     }
   }
 }
 
-// --- Function: Apply SSR Output (Duty Cycle Control) ---
-// This function controls the Solid State Relay based on the calculated duty.
-// It implements a time-proportional control by turning the SSR ON for 'duty' ms
-// and OFF for 'windowSize - duty' ms.
-void applyOutput(double duty) {
-  // Ensure duty cycle is non-negative and within the window size
-  duty = constrain(duty, 0, windowSize); // Prevents negative or excessively large duty cycles
+// --- Function: Non-Blocking SSR Output Control ---
+// This function manages the SSR state based on the current duty cycle without blocking.
+// It should be called repeatedly in the main loop.
+void manageSSR(double targetDuty) {
+  unsigned long now = millis();
 
-  // Turn SSR ON for the calculated 'duty' duration
-  if (duty > 0) { // Only turn on if there's a positive duty cycle
-    digitalWrite(SSR_PIN, HIGH);
-    digitalWrite(LED_RED, LOW);     // Assuming LOW turns on the LED (common anode or inverse logic)
-    digitalWrite(LED_GREEN, HIGH);  // Other LEDs off
-    digitalWrite(LED_BLUE, HIGH);
-    delay((int)duty); // Keep SSR active for this duration
+  // If a new window cycle should start
+  if (now - ssrWindowStartTime >= windowSize) {
+    ssrWindowStartTime = now; // Reset window start time
+    ssrOnDuration = constrain(targetDuty, 0, windowSize); // Set the ON duration for this new cycle
+    ssrOnState = false; // Reset SSR state to OFF at the start of a new window
   }
 
-  // Turn SSR OFF for the remaining part of the window cycle
-  digitalWrite(SSR_PIN, LOW);
-  digitalWrite(LED_RED, HIGH);    // Assuming HIGH turns off the LED
-    digitalWrite(LED_GREEN, HIGH);
-  digitalWrite(LED_BLUE, LOW);    // Assuming LOW turns on the LED, indicating SSR is off
-  delay((int)(windowSize - duty)); // Keep SSR inactive for the remaining duration
+  // Manage SSR state within the current window
+  if (ssrOnState) {
+    // SSR is currently ON, check if it should turn OFF
+    if (now - ssrWindowStartTime >= ssrOnDuration) {
+      digitalWrite(SSR_PIN, LOW);
+      digitalWrite(LED_RED, HIGH);    // Red LED OFF
+      digitalWrite(LED_BLUE, LOW);    // Blue LED ON (SSR OFF indicator)
+      ssrOnState = false; // Mark as OFF
+    }
+  } else {
+    // SSR is currently OFF, check if it should turn ON
+    if (ssrOnDuration > 0 && (now - ssrWindowStartTime < ssrOnDuration)) {
+      digitalWrite(SSR_PIN, HIGH);
+      digitalWrite(LED_RED, LOW);     // Red LED ON
+      digitalWrite(LED_BLUE, HIGH);   // Blue LED OFF
+      ssrOnState = true; // Mark as ON
+    }
+  }
+  // The LED_GREEN is not tied to SSR state directly in this revised logic,
+  // it can be used for general system health or other indicators.
 }
+
 
 // --- Setup Function: Runs once on startup ---
 void setup() {
@@ -160,7 +170,7 @@ void setup() {
   Serial.println(ssid);
   WiFi.begin(ssid, password); // Start WiFi connection
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(500); // This delay is fine in setup, as it's a one-time blocking operation
     Serial.print(".");
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // Blink built-in LED during connection
   }
@@ -194,10 +204,10 @@ void setup() {
 
 // --- Loop Function: Runs repeatedly after setup ---
 void loop() {
-  // --- MQTT Connection Check and Maintenance ---
-  if (!client.connected()) {
-    reconnect(); // Attempt to reconnect if not connected
-  }
+  unsigned long now = millis(); // Get current time once per loop for consistency
+
+  // --- MQTT Connection Check and Maintenance (Non-Blocking) ---
+  reconnectNonBlocking();
   client.loop(); // Must be called frequently to process MQTT messages and maintain connection
 
   // --- Temperature Reading ---
@@ -210,14 +220,13 @@ void loop() {
     Serial.print("!!! THERMOCOUPLE ERROR !!! Invalid reading: ");
     Serial.print(Input);
     Serial.println(" C. Turning off SSR.");
-    applyOutput(0); // Turn off SSR immediately
+    manageSSR(0); // Turn off SSR immediately
     // Do not proceed with PID computation or dTemp_dt calculation on bad input
-    return; // Exit loop for this iteration
+    return; // Exit loop for this iteration, try again next loop
   }
 
 
   // --- Calculate Rate of Change over 3-second window ---
-  unsigned long now = millis();
   if (now - lastRateCalculationTime >= RATE_CALCULATION_INTERVAL) { // Calculate dTemp_dt every 3 seconds
     float tempChange = Input - tempAtRateCalculationStart;
     unsigned long timeElapsed = now - lastRateCalculationTime; // In milliseconds
@@ -272,9 +281,8 @@ void loop() {
     Serial.println(currentDuty);
   }
 
-
-  // --- Apply SSR Output ---
-  applyOutput(currentDuty); // Control the SSR based on the determined duty cycle
+  // --- Apply SSR Output (Non-Blocking) ---
+  manageSSR(currentDuty); // Control the SSR based on the determined duty cycle
 
   // --- MQTT Data Publishing ---
   // Publish data approximately every 2 seconds to avoid flooding the broker and provide timely updates
