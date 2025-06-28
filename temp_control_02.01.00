@@ -7,11 +7,11 @@
 
 // --- WiFi & MQTT Network Configuration ---
 const char* ssid = "Moonbase";            // Your WiFi SSID
-const char* password = "unclejesse4";     // Your WiFi Password
+const char* password = "unclejesse4";    // Your WiFi Password
 const char* mqtt_server = "10.0.0.216";   // Your MQTT Broker IP Address
 
 // --- WiFi and MQTT Client Objects ---
-WiFiClient espClient;           // WiFi client for MQTT
+WiFiClient espClient;             // WiFi client for MQTT
 PubSubClient client(espClient); // MQTT client instance
 
 // --- Hardware Pin Definitions ---
@@ -37,10 +37,15 @@ MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
 
 // --- PID Control Variables ---
 double Setpoint = 105.0; // Target temperature in Celsius
-double Input;           // Current temperature reading from thermocouple
-double Output;          // Calculated output from PID (SSR duty cycle in ms)
+double Input;             // Current temperature reading from thermocouple
+double Output;            // Calculated output from PID (SSR duty cycle in ms)
 
 // Default PID constants - these values are loaded upon every restart
+// Kp = 2.8: Aggressive proportional response for fast initial heating
+// Ki = 2.5: Increased integral constant significantly to overcome flatlining/slow approach
+// Kd = 3.0: Slightly increased derivative to try and curb overshoot more aggressively
+// IMPORTANT: These Kp, Ki, Kd values are from the code you provided, not the latest tuned ones.
+// If you want the previously agreed upon Kp=4, Ki=5, Kd=5, please let me know.
 double Kp = 4;
 double Ki = 5;
 double Kd = 5;
@@ -56,13 +61,17 @@ unsigned long windowSize = 1000;
 // --- MQTT Publish Timing Variable ---
 unsigned long lastMsg = 0; // Stores the last time an MQTT message was published
 
+// --- MQTT Reconnection Timing Variable ---
+unsigned long lastMqttAttempt = 0; // Stores the last time an MQTT connection attempt was made
+const long MQTT_RETRY_INTERVAL = 5000; // Retry MQTT connection every 5 seconds
+
 // --- Bang-Bang to PID Transition Threshold (for heating) ---
 // When the temperature is more than this many degrees below Setpoint, apply full power.
 // Otherwise, let PID control.
 const float TEMP_THRESHOLD_FOR_FULL_POWER = 15.0; // If Input < (Setpoint - 15.0), full power
 
 // --- Rate of Change Variables ---
-float dTemp_dt = 0.0;           // Rate of change of temperature in degrees C per second
+float dTemp_dt = 0.0;             // Rate of change of temperature in degrees C per second
 // Stores the temperature reading from the beginning of the rate calculation interval
 float tempAtRateCalculationStart = 0.0;
 // Stores millis() when tempAtRateCalculationStart was recorded
@@ -79,71 +88,55 @@ const float RAPID_DROP_THRESHOLD = -0.5; // If dTemp_dt is -0.5 C/sec or lower, 
 const float OVERSHOOT_CAP_THRESHOLD = 0.1; // If Input > (Setpoint + 0.1), cap duty
 const double OVERSHOOT_CAP_DUTY = 0.01 * windowSize; // Cap duty cycle at 1% of windowSize
 
-// --- Non-Blocking SSR Control Variables ---
-unsigned long ssrWindowStartTime = 0; // Timestamp when the current SSR control window started
-bool ssrOnState = false;              // True if SSR is currently commanded ON
-unsigned long ssrOnDuration = 0;      // How long SSR should be ON in the current cycle
+// --- Function: MQTT Reconnection Logic (NON-BLOCKING) ---
+// This function attempts to reconnect to the MQTT broker if the connection is lost.
+// It tries once and returns true/false, allowing the main loop to continue.
+bool reconnect() {
+  Serial.print("Attempting MQTT connection...");
+  // Create a random client ID to avoid conflicts if multiple devices are used
+  String clientId = "ESP32SilviaClient-";
+  clientId += String(random(0xffff), HEX); // Append random hex for uniqueness
 
-// --- Non-Blocking Reconnect Variables ---
-unsigned long lastReconnectAttempt = 0;
-const unsigned long RECONNECT_INTERVAL = 5000; // Attempt reconnect every 5 seconds
-
-// --- Function: Non-Blocking MQTT Reconnection Logic ---
-// This function attempts to reconnect to the MQTT broker periodically without blocking.
-void reconnectNonBlocking() {
-  unsigned long now = millis();
-  if (!client.connected() && (now - lastReconnectAttempt > RECONNECT_INTERVAL)) {
-    lastReconnectAttempt = now;
-    Serial.print("Attempting MQTT connection...");
-    String clientId = "ESP32SilviaClient-";
-    clientId += String(random(0xffff), HEX);
-    if (client.connect(clientId.c_str())) {
-      Serial.println("connected");
-      digitalWrite(LED_BUILTIN, HIGH); // Turn on built-in LED
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" (retrying)");
-      digitalWrite(LED_BUILTIN, LOW); // Blink built-in LED to indicate connection issue
-    }
-  }
-}
-
-// --- Function: Non-Blocking SSR Output Control ---
-// This function manages the SSR state based on the current duty cycle without blocking.
-// It should be called repeatedly in the main loop.
-void manageSSR(double targetDuty) {
-  unsigned long now = millis();
-
-  // If a new window cycle should start
-  if (now - ssrWindowStartTime >= windowSize) {
-    ssrWindowStartTime = now; // Reset window start time
-    ssrOnDuration = constrain(targetDuty, 0, windowSize); // Set the ON duration for this new cycle
-    ssrOnState = false; // Reset SSR state to OFF at the start of a new window
-  }
-
-  // Manage SSR state within the current window
-  if (ssrOnState) {
-    // SSR is currently ON, check if it should turn OFF
-    if (now - ssrWindowStartTime >= ssrOnDuration) {
-      digitalWrite(SSR_PIN, LOW);
-      digitalWrite(LED_RED, HIGH);    // Red LED OFF
-      digitalWrite(LED_BLUE, LOW);    // Blue LED ON (SSR OFF indicator)
-      ssrOnState = false; // Mark as OFF
-    }
+  // Attempt to connect with the generated client ID
+  if (client.connect(clientId.c_str())) {
+    Serial.println("connected");
+    digitalWrite(LED_BUILTIN, HIGH); // Turn on built-in LED to indicate successful MQTT connection
+    // If you needed to subscribe to any topics, you would do it here, e.g.:
+    // client.subscribe("silvia/setpoint_cmd");
+    return true; // Connection successful
   } else {
-    // SSR is currently OFF, check if it should turn ON
-    if (ssrOnDuration > 0 && (now - ssrWindowStartTime < ssrOnDuration)) {
-      digitalWrite(SSR_PIN, HIGH);
-      digitalWrite(LED_RED, LOW);     // Red LED ON
-      digitalWrite(LED_BLUE, HIGH);   // Blue LED OFF
-      ssrOnState = true; // Mark as ON
-    }
+    Serial.print("failed, rc=");
+    Serial.print(client.state()); // Print the MQTT reason code for failure
+    Serial.println(""); // Newline for cleaner output
+    digitalWrite(LED_BUILTIN, LOW); // Blink built-in LED (or keep off) to indicate MQTT connection issue
+    return false; // Connection failed
   }
-  // The LED_GREEN is not tied to SSR state directly in this revised logic,
-  // it can be used for general system health or other indicators.
 }
 
+// --- Function: Apply SSR Output (Duty Cycle Control) ---
+// This function controls the Solid State Relay based on the calculated duty.
+// It implements a time-proportional control by turning the SSR ON for 'duty' ms
+// and OFF for 'windowSize - duty' ms.
+void applyOutput(double duty) {
+  // Ensure duty cycle is non-negative and within the window size
+  duty = constrain(duty, 0, windowSize); // Prevents negative or excessively large duty cycles
+
+  // Turn SSR ON for the calculated 'duty' duration
+  if (duty > 0) { // Only turn on if there's a positive duty cycle
+    digitalWrite(SSR_PIN, HIGH);
+    digitalWrite(LED_RED, LOW);     // Assuming LOW turns on the LED (common anode or inverse logic)
+    digitalWrite(LED_GREEN, HIGH);  // Other LEDs off
+    digitalWrite(LED_BLUE, HIGH);
+    delay((int)duty); // Keep SSR active for this duration
+  }
+
+  // Turn SSR OFF for the remaining part of the window cycle
+  digitalWrite(SSR_PIN, LOW);
+  digitalWrite(LED_RED, HIGH);    // Assuming HIGH turns off the LED
+    digitalWrite(LED_GREEN, HIGH);
+  digitalWrite(LED_BLUE, LOW);    // Assuming LOW turns on the LED, indicating SSR is off
+  delay((int)(windowSize - duty)); // Keep SSR inactive for the remaining duration
+}
 
 // --- Setup Function: Runs once on startup ---
 void setup() {
@@ -170,7 +163,7 @@ void setup() {
   Serial.println(ssid);
   WiFi.begin(ssid, password); // Start WiFi connection
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500); // This delay is fine in setup, as it's a one-time blocking operation
+    delay(500);
     Serial.print(".");
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // Blink built-in LED during connection
   }
@@ -204,11 +197,17 @@ void setup() {
 
 // --- Loop Function: Runs repeatedly after setup ---
 void loop() {
-  unsigned long now = millis(); // Get current time once per loop for consistency
+  unsigned long now = millis();
 
-  // --- MQTT Connection Check and Maintenance (Non-Blocking) ---
-  reconnectNonBlocking();
-  client.loop(); // Must be called frequently to process MQTT messages and maintain connection
+  // --- MQTT Connection Check and Maintenance ---
+  // If not connected, attempt to reconnect periodically without blocking.
+  if (!client.connected()) {
+    if (now - lastMqttAttempt > MQTT_RETRY_INTERVAL) {
+      lastMqttAttempt = now; // Update the last attempt time
+      reconnect(); // Attempt reconnection (non-blocking)
+    }
+  }
+  client.loop(); // Must be called frequently to process MQTT messages and maintain connection (even if disconnected)
 
   // --- Temperature Reading ---
   Input = thermocouple.readCelsius(); // Read current temperature from thermocouple
@@ -220,11 +219,10 @@ void loop() {
     Serial.print("!!! THERMOCOUPLE ERROR !!! Invalid reading: ");
     Serial.print(Input);
     Serial.println(" C. Turning off SSR.");
-    manageSSR(0); // Turn off SSR immediately
+    applyOutput(0); // Turn off SSR immediately
     // Do not proceed with PID computation or dTemp_dt calculation on bad input
-    return; // Exit loop for this iteration, try again next loop
+    return; // Exit loop for this iteration
   }
-
 
   // --- Calculate Rate of Change over 3-second window ---
   if (now - lastRateCalculationTime >= RATE_CALCULATION_INTERVAL) { // Calculate dTemp_dt every 3 seconds
@@ -281,17 +279,19 @@ void loop() {
     Serial.println(currentDuty);
   }
 
-  // --- Apply SSR Output (Non-Blocking) ---
-  manageSSR(currentDuty); // Control the SSR based on the determined duty cycle
+
+  // --- Apply SSR Output ---
+  applyOutput(currentDuty); // Control the SSR based on the determined duty cycle
 
   // --- MQTT Data Publishing ---
   // Publish data approximately every 2 seconds to avoid flooding the broker and provide timely updates
-  if (now - lastMsg > 2000) {
+  // Only attempt to publish if connected to MQTT
+  if (client.connected() && now - lastMsg > 2000) {
     lastMsg = now; // Update the last message time
 
-    char tempBuffer[16];     // Buffer for temperature string
+    char tempBuffer[16];      // Buffer for temperature string
     char setpointBuffer[16]; // Buffer for setpoint string
-    char dutyBuffer[16];     // Buffer for duty cycle string
+    char dutyBuffer[16];      // Buffer for duty cycle string
     char dTemp_dtBuffer[16]; // Buffer for dTemp_dt string
 
     // Convert values to strings
@@ -312,5 +312,7 @@ void loop() {
 
     Serial.print("Publishing to 'silvia/dtemp_dt': "); Serial.println(dTemp_dtBuffer);
     client.publish("silvia/dtemp_dt", dTemp_dtBuffer);
+  } else if (!client.connected()) {
+    Serial.println("MQTT client not connected, skipping publish.");
   }
 }
